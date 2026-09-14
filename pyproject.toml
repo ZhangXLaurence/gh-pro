@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gh-pro-contributor"
+version = "0.1.0"
+description = "Evidence-based GitHub achievement reports and contribution opportunities"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [{name = "Xiao Zhang"}]
+dependencies = []
+
+[project.scripts]
+gh-pro = "gh_pro.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["gh_pro*"]
