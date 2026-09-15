@@ -53,6 +53,8 @@ python3 -m gh_pro report reports/audit.json
 
 Repeat `--repo` for up to five repositories. Results are a bounded sample, not an exhaustive search. Read the issue or discussion and its linked work before contributing. No suitable candidate is a valid result.
 
+Discovery accepts repository and organization Discussion URLs returned by the selected repository's API. An ordinary Issue search failure does not hide available Discussions. If GitHub reports a rate limit, the run stops sending requests and reports any evidence already collected; retry later instead of repeatedly running the command.
+
 ## Confirming achievements
 
 GitHub awards achievements. An API count alone does not prove an award or a tier upgrade. Record badges you have actually checked on your profile in a local JSON file:

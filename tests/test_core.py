@@ -1,12 +1,14 @@
 import copy
 import io
 import json
+import subprocess
 import unittest
+from urllib.error import HTTPError
 from contextlib import redirect_stdout
 from unittest.mock import patch
 
 from gh_pro.cli import main
-from gh_pro.client import APIError, Client, login, repository
+from gh_pro.client import APIError, Client, RateLimitError, login, repository
 from gh_pro.core import audit, discover, plan, public_report, render, safe_url
 
 
@@ -21,6 +23,7 @@ class FakeClient:
         self.responses = iter(responses)
         self.discussion_data = discussions
         self.calls = []
+        self.discussion_calls = []
 
     def get(self, endpoint):
         self.calls.append(endpoint)
@@ -30,12 +33,20 @@ class FakeClient:
         return copy.deepcopy(data)
 
     def discussions(self, name):
+        self.discussion_calls.append(name)
         if isinstance(self.discussion_data, Exception):
             raise self.discussion_data
         return copy.deepcopy(self.discussion_data)
 
 
 class AuditTests(unittest.TestCase):
+    def test_rate_limit_stops_audit_without_requesting_repositories(self):
+        client = FakeClient([RateLimitError("limited")])
+        result = audit(client, "tester")
+        self.assertEqual(len(client.calls), 1)
+        self.assertIsNone(result["authored_merged_prs"]["count"])
+        self.assertEqual(result["repositories_completeness"], "unavailable")
+
     def test_missing_star_count_is_unknown(self):
         r = repo(); del r["stargazers_count"]
         data = audit(FakeClient([{"total_count": 2}, [r]]), "tester")
@@ -91,6 +102,48 @@ class AuditTests(unittest.TestCase):
 
 
 class OpportunityTests(unittest.TestCase):
+    def test_organization_discussions_keep_owner_and_route_checks(self):
+        base = {"title": "Question", "closed": False, "locked": False, "answer": None,
+                "category": {"isAnswerable": True}}
+        urls = ["https://github.com/orgs/tester/discussions/12",
+                "https://github.com/tester/project/discussions/13",
+                "https://github.com/orgs/another/discussions/12",
+                "https://github.com/orgs/tester-extra/discussions/12",
+                "https://github.com/tester/another/discussions/12",
+                "https://github.com/orgs/tester/discussions/12/extra",
+                "https://github.com/orgs/tester/discussions/not-a-number"]
+        client = FakeClient([repo(has_discussions=True), {"items": []}],
+                            {"isPrivate": False, "isArchived": False,
+                             "discussions": {"nodes": [dict(base, url=url) for url in urls]}})
+        result = discover(client, ["tester/project"])
+        self.assertEqual({x["url"] for x in result["opportunities"]}, set(urls[:2]))
+        self.assertIn(urls[0], render(result))
+
+    def test_issue_failure_does_not_hide_available_discussions(self):
+        item = {"title": "Question", "url": "https://github.com/tester/project/discussions/1",
+                "closed": False, "locked": False, "answer": None, "category": {"isAnswerable": True}}
+        client = FakeClient([repo(has_discussions=True), APIError("search unavailable")],
+                            {"isPrivate": False, "isArchived": False, "discussions": {"nodes": [item]}})
+        result = discover(client, ["tester/project"])
+        self.assertEqual(len(result["opportunities"]), 1)
+        self.assertIn("Issue search for tester/project", result["warnings"][0])
+
+    def test_rate_limit_stops_discovery_at_each_request_stage(self):
+        for stage in ("metadata", "issues", "discussions"):
+            with self.subTest(stage=stage):
+                responses = [RateLimitError("limited")] if stage == "metadata" else [repo(has_discussions=True)]
+                if stage == "issues":
+                    responses.append(RateLimitError("limited"))
+                elif stage == "discussions":
+                    responses.append({"items": [{"title": "Improve docs", "state": "open", "assignees": [],
+                                                "html_url": "https://github.com/tester/project/issues/1"}]})
+                client = FakeClient(responses, RateLimitError("limited"))
+                result = discover(client, ["tester/project", "tester/other"])
+                self.assertEqual(client.discussion_calls, ["tester/project"] if stage == "discussions" else [])
+                self.assertNotIn("tester/other", result["repositories_scanned"])
+                self.assertEqual(len(result["opportunities"]), 1 if stage == "discussions" else 0)
+                self.assertIn("limited", result["warnings"])
+
     def test_recent_questions_rank_ahead_of_old_threads(self):
         base = {"title": "Question", "closed": False, "locked": False, "answer": None, "category": {"isAnswerable": True}}
         items = [dict(base, url="https://github.com/tester/project/discussions/1", createdAt="2021-01-01T00:00:00Z"),
@@ -138,6 +191,37 @@ class OpportunityTests(unittest.TestCase):
 
 
 class SafetyTests(unittest.TestCase):
+    def test_cli_rest_and_graphql_limits_are_recognized(self):
+        responses = [
+            {"message": "You have exceeded a secondary rate limit."},
+            {"message": "API rate limit exceeded"},
+            {"errors": [{"type": "RATE_LIMITED", "message": "limited"}]},
+        ]
+        for payload in responses:
+            with self.subTest(payload=payload):
+                response = subprocess.CompletedProcess([], 1, json.dumps(payload), "")
+                with patch("gh_pro.client.subprocess.run", return_value=response) as run:
+                    with self.assertRaises(RateLimitError):
+                        Client(auth_gh=True).get("repos/tester/project")
+                    run.assert_called_once()
+
+    def test_http_limits_and_permission_errors_are_distinguished(self):
+        cases = [(429, {}, {}, True),
+                 (403, {"Retry-After": "60"}, {}, True),
+                 (403, {"X-RateLimit-Remaining": "0"}, {}, True),
+                 (403, {}, {"message": "You have exceeded a secondary rate limit."}, True),
+                 (403, {}, {"message": "Resource not accessible"}, False)]
+        for status, headers, body, limited in cases:
+            with self.subTest(status=status, headers=headers, body=body):
+                error = HTTPError("https://api.github.com/repos/tester/project", status, "error", headers,
+                                  io.BytesIO(json.dumps(body).encode()))
+                with patch("gh_pro.client.urllib.request.build_opener") as opener:
+                    opener.return_value.open.side_effect = error
+                    with self.assertRaises(APIError) as caught:
+                        Client().get("repos/tester/project")
+                    self.assertEqual(isinstance(caught.exception, RateLimitError), limited)
+                    opener.return_value.open.assert_called_once()
+
     def test_json_projection_discards_private_and_extra_fields(self):
         r = {"schema_version": 1, "kind": "audit", "scope": "public", "token": "secret",
              "repositories": [{"name": "secret", "url": "https://github.com/a/private", "visibility": "private"},

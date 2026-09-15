@@ -24,6 +24,8 @@ python3 -m gh_pro plan reports/opportunities.json --minutes 45
 
 `OWNER/REPO` 替换为想贡献的公开项目，可重复指定，最多 5 个。发现器返回有限样本；当前没有合适事项时会如实报告。投入时间是粗略估计，开始前还需检查讨论上下文和已关联的 PR。
 
+发现器支持所选仓库 API 返回的仓库级和组织级 Discussions 链接。Issue 搜索发生一般错误时仍可读取问答；遇到 GitHub 限流则停止本次运行的后续请求，保留已获得的结果并提示稍后重试。
+
 所有命令支持 `--format json`、`--format markdown` 和 `--output PATH`；指定文件会覆盖该文件。`report` 可以离线将 JSON 报告转成 Markdown。个人报告默认留在本地，示例中的 `reports/` 已被 Git 忽略。
 
 成就通过 `audit --baseline baseline.json` 导入人工核实记录，格式见英文 README。缺少记录时显示未知，不要求先录入才能使用。Stars 按单仓库统计；不会把账号收藏的其他仓库或多个仓库的 Star 相加。

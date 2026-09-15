@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "gh-pro-contributor"
-version = "0.1.0"
+version = "0.1.1"
 description = "Evidence-based GitHub achievement reports and contribution opportunities"
 readme = "README.md"
 requires-python = ">=3.10"
