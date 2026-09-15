@@ -11,6 +11,24 @@ class APIError(Exception):
     """An unavailable remote observation, never a zero count."""
 
 
+class RateLimitError(APIError):
+    """Stop this run rather than sending more requests after a rate limit."""
+
+
+RATE_LIMIT_MESSAGE = "GitHub rate limit reached; stopped requests. Retry later."
+
+
+def rate_limited(data):
+    if not isinstance(data, dict):
+        return False
+    message = str(data.get("message", "")).lower()
+    errors = data.get("errors")
+    return ("rate limit" in message or "rate-limit" in message or
+            (isinstance(errors, list) and any(
+                isinstance(error, dict) and error.get("type") == "RATE_LIMITED"
+                for error in errors)))
+
+
 def login(value):
     if not re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?", value):
         raise ValueError("Invalid GitHub username")
@@ -50,12 +68,16 @@ class Client:
             )
         except (OSError, subprocess.TimeoutExpired) as exc:
             raise APIError("GitHub CLI unavailable or timed out") from exc
-        if result.returncode:
-            raise APIError("GitHub CLI request failed; check authentication, permissions, or rate limits")
         try:
             data = json.loads(result.stdout)
         except json.JSONDecodeError as exc:
+            if result.returncode:
+                raise APIError("GitHub CLI request failed; check authentication or permissions") from exc
             raise APIError("GitHub CLI returned invalid JSON") from exc
+        if rate_limited(data):
+            raise RateLimitError(RATE_LIMIT_MESSAGE)
+        if result.returncode:
+            raise APIError("GitHub CLI request failed; check authentication or permissions")
         if isinstance(data, dict) and data.get("errors"):
             raise APIError("GraphQL returned errors; data was not counted")
         return data
@@ -73,6 +95,16 @@ class Client:
         try:
             with urllib.request.build_opener(NoRedirect).open(req, timeout=20) as response:
                 return json.load(response)
+        except urllib.error.HTTPError as exc:
+            try:
+                data = json.loads(exc.read())
+            except (ValueError, OSError):
+                data = {}
+            if (exc.code == 429 or rate_limited(data) or
+                    (exc.code == 403 and (exc.headers.get("Retry-After") is not None or
+                                         exc.headers.get("X-RateLimit-Remaining") == "0"))):
+                raise RateLimitError(RATE_LIMIT_MESSAGE) from exc
+            raise APIError("Public GitHub API request failed (unavailable resource or permission)") from exc
         except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError) as exc:
             raise APIError("Public GitHub API request failed (network, rate limit, or unavailable resource)") from exc
 

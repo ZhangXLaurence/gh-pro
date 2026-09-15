@@ -5,7 +5,7 @@ import re
 from datetime import datetime, timezone
 from urllib.parse import urlencode, urlparse
 
-from .client import APIError, login, repository
+from .client import APIError, RateLimitError, login, repository
 
 RULE_SOURCE = "https://github.com/Schweinepriester/github-profile-achievements"
 RULES = {
@@ -53,6 +53,18 @@ def confirmed_badges(baseline, username):
     return result
 
 
+def discussion_url(url, repo):
+    """Accept repo and organization routes returned by this repo's GraphQL query."""
+    url = safe_url(url)
+    if not url:
+        return ""
+    owner = repo.split("/")[0]
+    path = urlparse(url).path
+    routes = (f"/{repo}/discussions/", f"/orgs/{owner}/discussions/")
+    return url if any(re.fullmatch(re.escape(route) + r"[1-9][0-9]*", path, re.IGNORECASE)
+                      for route in routes) else ""
+
+
 def audit(client, username, baseline=None):
     login(username)
     report = {"schema_version": 1, "kind": "audit", "username": username,
@@ -73,6 +85,9 @@ def audit(client, username, baseline=None):
             "query": f"author:{username} is:pr is:merged is:public",
             "url": "https://github.com/search?" + urlencode({"q": f"author:{username} is:pr is:merged is:public", "type": "pullrequests"}),
         }
+    except RateLimitError as exc:
+        report["warnings"].append(str(exc))
+        return report
     except APIError as exc:
         report["warnings"].append(str(exc))
     seen = set()
@@ -129,6 +144,13 @@ def discover(client, repos, limit=5):
                 out["warnings"].append("A selected repository was excluded (private or archived)")
                 continue
             out["repositories_scanned"].append(repo)
+        except RateLimitError as exc:
+            out["warnings"].append(str(exc))
+            break
+        except APIError as exc:
+            out["warnings"].append(str(exc))
+            continue
+        try:
             q = urlencode({"q": f'repo:{repo} is:issue is:open no:assignee label:"good first issue"',
                            "sort": "updated", "order": "desc", "per_page": 10})
             data = client.get("search/issues?" + q)
@@ -148,9 +170,11 @@ def discover(client, repos, limit=5):
                         "repo": repo, "visibility": "public", "minutes_estimate": 45 if docs else 90,
                         "score": 3 if docs else 2, "achievement": "pull-shark", "created_at": item.get("created_at", ""),
                         "reason": "Open, unassigned, maintainer-labelled good first issue. Check comments and linked PRs before starting."})
-        except APIError as exc:
+        except RateLimitError as exc:
             out["warnings"].append(str(exc))
-            continue
+            break
+        except APIError as exc:
+            out["warnings"].append(f"Issue search for {repo}: {exc}")
         if not metadata.get("has_discussions"):
             continue
         try:
@@ -162,16 +186,19 @@ def discover(client, repos, limit=5):
                     continue
                 if not (item.get("category") or {}).get("isAnswerable"):
                     continue
-                url = safe_url(item.get("url", ""))
-                if not url or not url.lower().startswith(f"https://github.com/{repo.lower()}/discussions/") or url in seen:
+                url = discussion_url(item.get("url", ""), repo)
+                if not url or url in seen:
                     continue
                 seen.add(url)
                 out["opportunities"].append({"kind": "discussion", "title": item.get("title", "Untitled"),
                     "url": url, "repo": repo, "visibility": "public", "minutes_estimate": 30,
                     "score": 3, "achievement": "galaxy-brain", "created_at": item.get("createdAt", ""),
                     "reason": "Unanswered question in an answerable category. Read context and verify a solution; acceptance is up to the community."})
-        except APIError as exc:
+        except RateLimitError as exc:
             out["warnings"].append(str(exc))
+            break
+        except APIError as exc:
+            out["warnings"].append(f"Discussions for {repo}: {exc}")
     # Stable sorts keep recent questions ahead of old threads with a new comment.
     out["opportunities"].sort(key=lambda x: x["url"])
     out["opportunities"].sort(key=lambda x: x["created_at"], reverse=True)
